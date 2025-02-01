@@ -29,27 +29,21 @@ pub const Request = struct {
     /// Request method
     method: Method,
     /// Request headers
-    headers: []Header,
+    headers: std.StringHashMap(Header),
     /// Request body
     body: []const u8,
     /// Route to which request is made
     route: []u8,
 
     pub fn get_header(self: *Request, key: []u16) ?Header {
-        for (self.headers) |header| {
-            if (header.key == key) {
-                return header;
-            }
-        }
-
-        return null;
+        return self.headers.get(key);
     }
 };
 
 /// HTTP request from client
 pub const Response = struct {
     /// Response headers
-    headers: []*Header,
+    headers: std.StringHashMap(*Header),
     /// Response body
     body: []const u8,
     /// Response status
@@ -61,25 +55,28 @@ pub const Response = struct {
     }
 
     fn get_headers_str(self: *Response, allocator: std.mem.Allocator) ![]u8 {
-        if (self.headers.len == 0) return "";
+        if (self.headers.count() == 0) return "";
         const sep = "\r\n";
 
         const total_len = blk: {
-            var sum: usize = sep.len * (self.headers.len);
-            for (self.headers) |header| sum += header.len();
+            var sum: usize = sep.len * (self.headers.count());
+            var iter = self.headers.iterator();
+            while (iter.next()) |header| {
+                sum += header.value_ptr.*.len();
+            }
             break :blk sum;
         };
 
         const buf = try allocator.alloc(u8, total_len);
         errdefer allocator.free(buf);
 
-        @memcpy(buf[0..self.headers[0].len()], try self.headers[0].get_str(allocator));
-        var buf_index: usize = self.headers[0].len();
-        @memcpy(buf[buf_index .. buf_index + sep.len], sep);
-        buf_index += sep.len;
-        for (self.headers[1..]) |header| {
-            @memcpy(buf[buf_index .. buf_index + header.len()], try header.get_str(allocator));
-            buf_index += header.len();
+        var iterator = self.headers.iterator();
+
+        var buf_index: usize = 0;
+        while (iterator.next()) |header| {
+            const hdr = header.value_ptr.*;
+            @memcpy(buf[buf_index .. buf_index + hdr.len()], try hdr.get_str(allocator));
+            buf_index += hdr.len();
             @memcpy(buf[buf_index .. buf_index + sep.len], sep);
             buf_index += sep.len;
         }
@@ -88,7 +85,7 @@ pub const Response = struct {
     }
 };
 
-pub fn GetServer() type {
+pub fn Server() type {
     return struct {
         running: bool = false,
         allocator: std.mem.Allocator,
@@ -98,7 +95,7 @@ pub fn GetServer() type {
 
         /// Create the server obcject
         pub fn init(allocator: std.mem.Allocator) !*Self {
-            const server = try allocator.create(GetServer());
+            const server = try allocator.create(Server());
             server.allocator = allocator;
 
             return server;
@@ -132,13 +129,17 @@ pub fn GetServer() type {
             var buffer: [1024]u8 = undefined;
 
             const bytesRead = try reader.read(&buffer);
-            const req = try self.parse(&buffer, bytesRead);
+            const req = try self.parse_alloc(&buffer, bytesRead);
             defer self.allocator.destroy(req);
 
             const response = try self.allocator.create(Response);
             defer self.allocator.destroy(response);
 
-            response.headers = &[0]*Header{};
+            response.headers = std.StringHashMap(*Header).init(self.allocator);
+            var cookieHeader = try self.allocator.create(Header);
+            cookieHeader.key = "cookie";
+            cookieHeader.value = "HELLO";
+            try response.headers.put("cookie", cookieHeader);
             response.body = "HHHH";
             response.status = 201;
 
@@ -147,7 +148,7 @@ pub fn GetServer() type {
             _ = try writer.write(str);
         }
 
-        fn parse(self: *Self, buffer: []u8, bytes_read: usize) !*Request {
+        fn parse_alloc(self: *Self, buffer: []u8, bytes_read: usize) !*Request {
             if (bytes_read < 4) {
                 return error.CantParse;
             }
@@ -186,19 +187,20 @@ pub fn GetServer() type {
             return error.InvalidMethod;
         }
 
-        fn get_headers(header_str: []const u8) ![]Header {
+        fn get_headers(header_str: []const u8) !std.StringHashMap(Header) {
             var iter = std.mem.splitSequence(u8, header_str, "\r\n");
-            var tmpHeaders = std.ArrayList(Header).init(std.heap.page_allocator);
+            var tmpHeaders = std.StringHashMap(Header).init(std.heap.page_allocator);
 
             while (iter.next()) |value| {
                 var hdr = std.mem.splitSequence(u8, value, ":");
-                try tmpHeaders.append(Header{
-                    .key = hdr.first(),
+                const key = hdr.first();
+                try tmpHeaders.put(key, Header{
+                    .key = key,
                     .value = std.mem.trim(u8, hdr.rest(), " "),
                 });
             }
 
-            return tmpHeaders.toOwnedSlice();
+            return tmpHeaders;
         }
     };
 }
