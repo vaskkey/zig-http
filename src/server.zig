@@ -33,7 +33,7 @@ pub const Request = struct {
     /// Request body
     body: []const u8,
     /// Route to which request is made
-    route: []u8,
+    route: []const u8,
 
     pub fn get_header(self: *Request, key: []u16) ?Header {
         return self.headers.get(key);
@@ -47,7 +47,7 @@ pub const Response = struct {
     /// Response body
     body: []const u8,
     /// Response status
-    status: u8,
+    status: u16,
 
     pub fn to_str(self: *Response, allocator: std.mem.Allocator) ![]u8 {
         const headers = try self.get_headers_str(allocator);
@@ -128,44 +128,75 @@ pub fn Server() type {
             const reader = server.stream.reader();
             var buffer: [1024]u8 = undefined;
 
+            // Parsing request
             const bytesRead = try reader.read(&buffer);
-            const req = try self.parse_alloc(&buffer, bytesRead);
+            const req = try self.parseAlloc(&buffer, bytesRead);
             defer self.allocator.destroy(req);
 
             const response = try self.allocator.create(Response);
             defer self.allocator.destroy(response);
 
+            // Header test
+
             response.headers = std.StringHashMap(*Header).init(self.allocator);
             var cookieHeader = try self.allocator.create(Header);
-            cookieHeader.key = "cookie";
+            defer self.allocator.destroy(cookieHeader);
+
+            cookieHeader.key = "Auth-Header";
             cookieHeader.value = "HELLO";
-            try response.headers.put("cookie", cookieHeader);
-            response.body = "HHHH";
-            response.status = 201;
+            try response.headers.put(cookieHeader.key, cookieHeader);
+
+            // Find requested file in path
+            const filePath = try self.allocator.alloc(u8, req.route.len + 1);
+            defer self.allocator.free(filePath);
+            @memcpy(filePath[0..1], ".");
+            @memcpy(filePath[1 .. req.route.len + 1], req.route);
+
+            response.status = 200;
+            response.body = std.fs.cwd().readFileAlloc(self.allocator, filePath, 1024) catch |err| switch (err) {
+                error.FileTooBig => body: {
+                    response.status = 413;
+                    break :body "Content Too Large";
+                },
+                error.FileNotFound => body: {
+                    response.status = 404;
+                    break :body req.route;
+                },
+                else => body: {
+                    response.status = 500;
+                    break :body "Internal Server Error";
+                },
+            };
 
             const str = try response.to_str(self.allocator);
 
             _ = try writer.write(str);
         }
 
-        fn parse_alloc(self: *Self, buffer: []u8, bytes_read: usize) !*Request {
+        fn parseAlloc(self: *Self, buffer: []u8, bytes_read: usize) !*Request {
             if (bytes_read < 4) {
                 return error.CantParse;
             }
 
             // Split call info, headers and body
             var iter = std.mem.splitSequence(u8, buffer, "\r\n");
-            const call = iter.first();
+
+            // first line e.g. GET / HTTP/1.1
+            const uriLine = iter.first();
+            var uriLineIter = std.mem.splitSequence(u8, uriLine, " ");
+            const method = uriLineIter.first();
+
             const rest = iter.rest();
             iter = std.mem.splitSequence(u8, rest, "\r\n\r\n");
+
             const headers_str = iter.first();
             const body = iter.rest();
 
             var request = try self.allocator.create(Request);
 
             request.body = body;
-            request.route = "";
-            request.method = try get_method(call);
+            request.route = uriLineIter.next() orelse "";
+            request.method = try get_method(method);
             request.headers = try get_headers(headers_str);
 
             return request;
